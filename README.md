@@ -1,4 +1,65 @@
 <div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>litgpt · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>7.48x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-7.48x-2ea44f"></a>
+    <a href="https://github.com/Lightning-AI/litgpt/commit/18c931c15c2398621d35371a12d2b1785e855bb6"><img alt="base" src="https://img.shields.io/badge/upstream-18c931c15c23-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-NVIDIA%20RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [Lightning-AI/litgpt](https://github.com/Lightning-AI/litgpt) at commit
+> [`18c931c15c23`](https://github.com/Lightning-AI/litgpt/commit/18c931c15c2398621d35371a12d2b1785e855bb6) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept verbatim at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python litgpt/__main__.py generate checkpoints/EleutherAI/pythia-410m --max_new_tokens 200 --num_samples 8` |
+| **Entry point** | `litgpt/generate/base.py` (LitGPT 0.5.13 flattened its CLI: `generate <checkpoint_dir>`, no `generate base` subcommand) |
+| **Unit measured** | one sample (200 generated tokens, pythia-410m, bf16) |
+| **Before (stock)** | 2.90 s per unit |
+| **After (this tree, all switches default ON)** | 0.39 s per unit |
+| **Speedup** | **7.48x** end to end, noise floor of the host 1.1% (median of 5 repeats) |
+| **Output** | bit-identical: max_abs_diff = 0 against the frozen stock reference on the pinned prompts and on held-out prompts |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `litgpt/generate/base.py` | generate_fn | 6.68x |
+| `litgpt/generate/base.py` | generate_fn | 1.026x |
+| `litgpt/model.py` | CausalSelfAttention.forward | 1.013x |
+
+
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/litgpt-ao.git
+cd litgpt-ao
+# set up exactly as upstream documents, then:
+python litgpt/__main__.py generate checkpoints/EleutherAI/pythia-410m --max_new_tokens 200 --num_samples 8
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 18c931c15c23` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+The upstream README is unchanged below.
+
+<div align="center">
 
 
 # ⚡ LitGPT

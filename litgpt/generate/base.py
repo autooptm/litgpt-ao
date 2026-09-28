@@ -1,5 +1,6 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
+import os
 import sys
 import time
 import warnings
@@ -125,6 +126,75 @@ def batched_next_token(model: GPT, input_pos: torch.Tensor, x: torch.Tensor, kwa
     return batched_sample(logits_list, kwargs=_kwargs)
 
 
+_AO_BUCKETS = (32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 448, 512)
+
+
+def _ao_opt_enabled() -> bool:
+    return os.environ.get("LITGPT_OPT_1", "1") != "0"
+
+
+class _StepDecoder:
+
+    def __init__(self, model, device, max_seq_length: int) -> None:
+        self.max_seq_length = max_seq_length
+        self.token = torch.zeros(1, 1, dtype=torch.int64, device=device)
+        self.pos = torch.ones(1, dtype=torch.int64, device=device)
+        self.buckets = [b for b in _AO_BUCKETS if b < max_seq_length] + [None]
+        self.step_bank = {b: self._build_step(model, b) for b in self.buckets}
+        self._at = 0
+
+    def _build_step(self, model, input_pos_maxp1):
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                model(self.token, self.pos, input_pos_maxp1=input_pos_maxp1)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            logits = model(self.token, self.pos, input_pos_maxp1=input_pos_maxp1)
+            self.pos.add_(1)
+        return g, logits
+
+    def start(self, position: int) -> None:
+        self.pos.fill_(position)
+        self._at = position
+
+    def step(self, token: torch.Tensor) -> torch.Tensor:
+        self.token.copy_(token.view(1, 1))
+        g, logits = self.step_bank[next((b for b in self.buckets
+                                          if b is None or b > self._at), None)]
+        g.replay()
+        self._at += 1
+        return logits
+
+
+def _ao_decoder(model, device, max_returned_tokens):
+    if not _ao_opt_enabled() or device.type != "cuda":
+        return None
+    if any(m.__class__.__name__ == "ThunderModule" for m in model.modules()):
+        return None
+    if getattr(model, "mask_cache", None) is None:
+        return None
+    decoder = getattr(model, "_ao_decoder", None)
+    if decoder is not None and decoder.max_seq_length == model.max_seq_length:
+        return decoder
+    try:
+        decoder = _StepDecoder(model, device, model.max_seq_length)
+    except Exception as exc:
+        print(f"[litgpt] optimized path unavailable ({exc}); using the stock path",
+              file=sys.stderr)
+        model._ao_decoder = None
+        return None
+    for block in model.transformer.h:
+        if block.attn.kv_cache is not None:
+            block.attn.kv_cache.reset_parameters()
+    model._ao_decoder = decoder
+    print(f"[litgpt] optimized path on: {len(decoder.step_bank)} bucket(s) for "
+          f"max_seq_length {model.max_seq_length}", file=sys.stderr)
+    return decoder
+
+
 @torch.inference_mode()
 def generate_fn(
     model: GPT,
@@ -169,6 +239,11 @@ def generate_fn(
     stop_progress = [0] * len(stop_tokens)
     yielded_idx = 0
 
+    decoder = _ao_decoder(model, device, max_returned_tokens)
+    block = max(1, int(os.environ.get("LITGPT_STOP_BLOCK", "16"))) if decoder else 1
+    pending = []
+    examined = 0
+
     # Generate output tokens.
     # The first token generated is the prefill token.
     # The input_pos for this token is the width of the entire prompt.
@@ -182,48 +257,63 @@ def generate_fn(
     input_pos_maxp1 = prompt_size if all(m.__class__.__name__ != "ThunderModule" for m in model.modules()) else None
     for current_idx in range(max_returned_tokens - prompt_size):
         # Generate the token
-        token = next_token(
-            model,
-            input_pos,
-            token.view(1, -1),
-            input_pos_maxp1=input_pos_maxp1,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )
-        tokens.append(token)
-        int_token = token.item()
-
-        # Check for stop sequences
-        # For each stop sequence, we keep a running total of how many are matched in stop_progress.
-        # If the current token matches the next token in the stop sequence, we increment the
-        # running total and hold off on yielding the token.
-        for i, seq in enumerate(stop_tokens):
-            if int_token == seq[stop_progress[i]]:
-                stop_progress[i] += 1
-                if stop_progress[i] == len(seq):
-                    if include_eos:
-                        yield from tokens[yielded_idx:]
-                    return
-            else:
-                stop_progress[i] = 0
-
-        # Yield tokens that are not part of a stop sequence in progress.
-        # If there are no stop sequences, then that's all of them.
-        if stop_tokens:
-            safe_idx = len(tokens) - max(stop_progress)
+        if prefill_token or decoder is None:
+            token = next_token(
+                model,
+                input_pos,
+                token.view(1, -1),
+                input_pos_maxp1=input_pos_maxp1,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
         else:
-            safe_idx = current_idx + 1  # include the token just generated
+            logits = decoder.step(token)
+            token = sample(logits, temperature=temperature, top_k=top_k, top_p=top_p).to(
+                dtype=torch.int64
+            )
+        tokens.append(token)
 
-        if yielded_idx < safe_idx:
-            y_tokens = tokens[yielded_idx:safe_idx]
-            yield from y_tokens
-            yielded_idx = safe_idx
+        pending.append(token)
+        if len(pending) >= block or current_idx == max_returned_tokens - prompt_size - 1:
+            int_tokens = torch.stack(pending).reshape(-1).tolist()
+            pending.clear()
+        else:
+            int_tokens = []
+
+        for int_token in int_tokens:
+            examined += 1
+            # For each stop sequence, we keep a running total of how many are matched in stop_progress.
+            # If the current token matches the next token in the stop sequence, we increment the
+            # running total and hold off on yielding the token.
+            for i, seq in enumerate(stop_tokens):
+                if int_token == seq[stop_progress[i]]:
+                    stop_progress[i] += 1
+                    if stop_progress[i] == len(seq):
+                        if include_eos:
+                            yield from tokens[yielded_idx:examined]
+                        return
+                else:
+                    stop_progress[i] = 0
+
+            # Yield tokens that are not part of a stop sequence in progress.
+            # If there are no stop sequences, then that's all of them.
+            if stop_tokens:
+                safe_idx = examined - max(stop_progress)
+            else:
+                safe_idx = examined  # include the token just generated
+
+            if yielded_idx < safe_idx:
+                y_tokens = tokens[yielded_idx:safe_idx]
+                yield from y_tokens
+                yielded_idx = safe_idx
 
         # Update input_pos for the next iteration.
         if prefill_token:
             prefill_token = False
             input_pos = torch.tensor([prompt_size], device=device, dtype=torch.int64)
+            if decoder is not None:
+                decoder.start(prompt_size)
         else:
             input_pos.add_(1)
         if input_pos_maxp1 is not None:

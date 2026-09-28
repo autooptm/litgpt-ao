@@ -509,8 +509,11 @@ class CausalSelfAttention(nn.Module):
         else:
             q_roped = apply_rope(q[..., :rope_n_elem], cos, sin)
             k_roped = apply_rope(k[..., :rope_n_elem], cos, sin)
-        q = torch.cat((q_roped, q[..., rope_n_elem:]), dim=-1)  # (B, nh_q, T, hs)
-        k = torch.cat((k_roped, k[..., rope_n_elem:]), dim=-1)  # (B, nh_k, T, hs)
+        if rope_n_elem == q.size(-1):
+            q, k = q_roped, k_roped
+        else:
+            q[..., :rope_n_elem] = q_roped  # (B, nh_q, T, hs)
+            k[..., :rope_n_elem] = k_roped  # (B, nh_k, T, hs)
 
         # Apply kv-cache during inference.
         if input_pos is not None:
